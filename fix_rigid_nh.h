@@ -15,6 +15,7 @@
 #define LMP_FIX_RIGID_NH_H
 
 #include "fix_rigid.h"
+#include <fstream>
 
 namespace LAMMPS_NS {
 
@@ -32,9 +33,36 @@ class FixRigidNH : public FixRigid {
   void write_restart(FILE *);
   void restart(char *buf);
   void reset_target(double);
+  void init_list(int, class NeighList *); // cs
+  double compute_array(int);
+   private:
+  class NeighList *list;
 
  protected:
   double **conjqm;                // conjugate quaternion momentum
+  // CS: modification
+  double *** pair_torque;                //CS: pair torque nbody*nbody
+  double *** final_torque;                //CS: pair torque nbody*nbody
+  double **total_torque;                    //  CS
+  double * cs_pe;
+  double * cs_pe_final;
+  double * body_pe;
+  double * flux;
+  
+  int nmax;
+  int natoms;
+  // dump pair torque and force ever never steps
+  int   ncount;
+  int   never;
+  int   dump_flag;
+  
+  double *** pair_force;
+  double *** final_force;
+  double ** total_force;
+  std::ofstream mydata;
+  std::ofstream body_properties;
+  // CS: end
+
   double boltz, nktv2p, mvv2e;    // boltzman constant, conversion factors
 
   int nf_t, nf_r;                       // trans/rot degrees of freedom

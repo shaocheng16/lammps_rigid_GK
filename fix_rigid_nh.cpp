@@ -38,9 +38,25 @@
 #include <cmath>
 #include <cstring>
 
+#include "math_const.h"
+
+
+#include "neighbor.h"
+#include "neigh_request.h"
+#include "neigh_list.h"
+#include "pair.h"
+#include <iomanip>
+#include <iostream>
+
 using namespace LAMMPS_NS;
 using namespace FixConst;
 using namespace RigidConst;
+using namespace std;
+
+inline int sbmask(int j) {
+    return j >> SBBITS & 3;
+  }
+
 
 /* ---------------------------------------------------------------------- */
 
@@ -124,6 +140,29 @@ FixRigidNH::FixRigidNH(LAMMPS *lmp, int narg, char **arg) :
   // memory allocation and initialization
 
   memory->create(conjqm,nbody,4,"rigid_nh:conjqm");
+
+  // memory allocation and initialization
+  // CS modified
+  memory->create(total_torque,nbody,3,"rigid_nh:total_torque");     //total torque of each particle
+  memory->create(pair_torque, nbody, nbody,3,"rigid_nh:pair_torque");
+  memory->create(final_torque, nbody, nbody,3,"rigid_nh:final_torque");
+  memory->create(total_force,nbody,3,"rigid_nh:total_force");     //total torque of each particle
+  memory->create(pair_force, nbody, nbody,3,"rigid_nh:pair_force");
+  memory->create(final_force, nbody, nbody,3,"rigid_nh:final_force");
+  natoms = atom->natoms;
+  memory->create(cs_pe, natoms, "rigid_nh:cs_pe");
+  memory->create(cs_pe_final, natoms,"rigid_nh:cs_pe_final");
+  memory->create(body_pe, nbody, "rigid_nh:body_pe");
+  memory->create(flux, 15, "rigid_nh:flux");
+  // open the data file
+  mydata.open("my_dump_data.txt");
+  body_properties.open("body_properties.txt");
+  // set the initial value for count
+  ncount=0;
+  never=5;
+  dump_flag=0;
+  // CS end
+
   if (tstat_flag || pstat_flag) {
     allocate_chain();
     allocate_order();
@@ -183,6 +222,29 @@ FixRigidNH::~FixRigidNH()
     if (pcomputeflag) modify->delete_compute(id_press);
     delete [] id_press;
   }
+
+  // CS: start modification
+  memory->destroy(pair_torque);
+  memory->destroy(final_torque);
+  memory->destroy(total_torque);
+  memory->destroy(pair_force);
+  memory->destroy(final_force);
+  memory->destroy(total_force);
+  
+  // CS modified
+  memory->destroy(cs_pe);
+  memory->destroy(cs_pe_final);
+  memory->destroy(body_pe);
+  memory->destroy(flux);
+  mydata.close();
+  body_properties.close();
+  // CS end
+}
+
+
+void FixRigidNH::init_list(int id, NeighList *ptr)
+{
+  list = ptr;
 }
 
 /* ---------------------------------------------------------------------- */
@@ -316,6 +378,13 @@ void FixRigidNH::init()
         if (modify->fix[i]->rigid_flag) rfix[nrigidfix++] = i;
     }
   }
+  // CS: need a full neighbor list once
+  int irequest = neighbor->request(this,instance_me);
+  neighbor->requests[irequest]->pair = 0;
+  neighbor->requests[irequest]->fix  = 1;
+  neighbor->requests[irequest]->half = 0;
+  neighbor->requests[irequest]->full = 1;
+  neighbor->requests[irequest]->occasional = 1;
 }
 
 /* ---------------------------------------------------------------------- */
@@ -420,6 +489,37 @@ void FixRigidNH::setup(int vflag)
     compute_press_target();
     nh_epsilon_dot();
   }
+  // CS: start modification
+  for (int ibody = 0; ibody < nbody; ibody++)
+    for (int jbody=0; jbody < nbody; jbody++ )
+      for (int temp=0; temp < 3; temp++)
+        pair_torque[ibody][jbody][temp] = 0;
+  for (int ibody = 0; ibody < nbody; ibody++)
+    for (int jbody=0; jbody < nbody; jbody++ )
+      for (int temp=0; temp < 3; temp++)
+        final_torque[ibody][jbody][temp] = 0;
+
+  for (int ibody = 0; ibody < nbody; ibody++)
+    for (int jbody=0; jbody < nbody; jbody++ )
+      for (int temp=0; temp < 3; temp++)
+        pair_force[ibody][jbody][temp] = 0;
+  for (int ibody = 0; ibody < nbody; ibody++)
+    for (int jbody=0; jbody < nbody; jbody++ )
+      for (int temp=0; temp < 3; temp++)
+        final_force[ibody][jbody][temp] = 0;
+
+  // CS modified
+  for (int ibody = 0; ibody < nbody; ibody++)
+      body_pe[ibody]=0;
+   //cerr<<"nmax="<<nmax<<endl;
+  for (int i = 0; i < natoms; i++){
+      cs_pe[i] = 0;
+      cs_pe_final[i] = 0;
+  }
+  for(int i=0; i<15;i++){
+    flux[i]=0;
+  }
+  // CS end
 }
 
 /* ----------------------------------------------------------------------
@@ -590,12 +690,60 @@ void FixRigidNH::initial_integrate(int vflag)
 
 void FixRigidNH::final_integrate()
 {
-  int ibody;
   double tmp,scale_t[3],scale_r;
   double dtfm;
   double mbody[3],tbody[3],fquat[4];
 
   double dtf2 = dtf * 2.0;
+
+  // CS: new variables
+  //
+  int i;
+  int inum,jnum;
+  double ** x = atom->x;
+  int *ilist,*jlist,*numneigh;
+  int **firstneigh;
+  int j, itype , jtype;
+  tagint *tag = atom->tag;
+  tagint itag,jtag;
+  int nlocal = atom->nlocal;
+  // CS modified
+  int npair = atom->nlocal;
+  if (force->newton) npair += atom->nghost;
+  // CS end
+  //
+  //---------add by CS
+  double unwrap[3];
+  double i_dx, i_dy, i_dz;   // disp vector of atom i in body body[i]
+  double j_dx, j_dy, j_dz;   // disp vector of atom j in body body[j]
+  int  ibody, jbody; 
+  
+  double *special_coul = force->special_coul;
+  double *special_lj = force->special_lj;
+  int newton_pair = force->newton_pair;
+
+  // check when to dump out
+  ncount++;
+  dump_flag=0;
+  if (ncount== never){
+    ncount=0;
+    dump_flag=1;
+  }
+
+  neighbor->build_one(list);
+
+  inum = list->inum;
+  ilist = list->ilist;
+  numneigh = list->numneigh;
+  firstneigh = list->firstneigh;
+  
+  
+  Pair *pair = force->pair;
+  double **cutsq = force->pair->cutsq;
+  int *type = atom->type;
+  
+  double xtmp,ytmp,ztmp,delx,dely,delz;
+  double rsq, eng, fpair,factor_coul,factor_lj;
 
   // compute scale variables
 
@@ -622,6 +770,96 @@ void FixRigidNH::final_integrate()
   // late calculation of forces and torques (if requested)
 
   if (!earlyflag) compute_forces_and_torques();
+
+  if(1==dump_flag){ // CS: start modification
+    for (ibody = 0; ibody < nbody; ibody++)
+      for (jbody = 0; jbody < nbody; jbody++){
+        pair_torque[ibody][jbody][0] = 0;
+        pair_torque[ibody][jbody][1] = 0;
+        pair_torque[ibody][jbody][2] = 0;
+      }
+    
+    for (ibody = 0; ibody < nbody; ibody++)
+      for (jbody = 0; jbody < nbody; jbody++){
+        pair_force[ibody][jbody][0] = 0;
+        pair_force[ibody][jbody][1] = 0;
+        pair_force[ibody][jbody][2] = 0;
+      }
+
+    for (int ii = 0; ii < inum; ii++) {
+      i = ilist[ii];
+      jlist = firstneigh[i];
+      jnum = numneigh[i];
+
+      xtmp = x[i][0];
+      ytmp = x[i][1];
+      ztmp = x[i][2];
+
+      itag = tag[i];
+      itype = type[i];
+
+      // disp vector of atom i in ibody
+      ibody=body[i];
+
+      domain->unmap(x[i],xcmimage[i],unwrap);
+      i_dx = unwrap[0] - xcm[ibody][0];
+      i_dy = unwrap[1] - xcm[ibody][1];
+      i_dz = unwrap[2] - xcm[ibody][2];
+
+      for (int jj = 0; jj < jnum; jj++){
+        j = jlist[jj];
+        factor_lj = special_lj[sbmask(j)];
+        factor_coul = special_coul[sbmask(j)];
+
+        j &= NEIGHMASK;
+
+        jtag=tag[j];
+        jtype = type[j];
+
+
+        jbody=int ((jtag-1)/60);
+
+        domain->unmap(x[j],xcmimage[j],unwrap);
+        j_dx = unwrap[0] - xcm[jbody][0];
+        j_dy = unwrap[1] - xcm[jbody][1];
+        j_dz = unwrap[2] - xcm[jbody][2];
+
+
+        delx = xtmp - x[j][0];    // distance between atom i and j
+        dely = ytmp - x[j][1];
+        delz = ztmp - x[j][2];
+
+        rsq = delx*delx + dely*dely + delz*delz;
+        {
+          if (rsq >= cutsq[itype][jtype]) continue;
+        }
+        eng = pair->single(i,j,itype,jtype,rsq,factor_coul,factor_lj,fpair);
+
+        double i_fx=delx*fpair;
+        double i_fy=dely*fpair;
+        double i_fz=delz*fpair;
+        //calculate the pair_torque
+        pair_torque[ibody][jbody][0] += (i_dy*i_fz - i_dz*i_fy);
+        pair_torque[ibody][jbody][1] += (i_dz*i_fx - i_dx*i_fz);
+        pair_torque[ibody][jbody][2] += (i_dx*i_fy - i_dy*i_fx);
+        //calculate the pair_force
+
+        pair_force[ibody][jbody][0] += i_fx;
+        pair_force[ibody][jbody][1] += i_fy;
+        pair_force[ibody][jbody][2] += i_fz;
+          }
+        }
+    MPI_Allreduce(pair_torque[0][0],final_torque[0][0],3*nbody*nbody,MPI_DOUBLE,MPI_SUM,world);
+    MPI_Allreduce(pair_force[0][0],final_force[0][0],3*nbody*nbody,MPI_DOUBLE,MPI_SUM,world);
+ 
+    }
+
+    //for (ibody = 0; ibody < nbody; ibody++)
+    //  for (jbody = 0; jbody < nbody; jbody++){
+    //    cerr<< final_force[ibody][jbody][0]<<"\t";
+    //  }
+    //cerr<< endl;
+
 
   // update vcm and angmom
   // fflag,tflag = 0 for some dimensions in 2d
@@ -692,6 +930,104 @@ void FixRigidNH::final_integrate()
   // virial is already setup from initial_integrate
 
   set_v();
+  // CS
+  // post-processing for rigid-body Green-Kubo calculation
+  // potential energy of each atoms
+  double total_pe=0;
+  eatom = force->pair->eatom;
+  if(!eatom) dump_flag=0;
+  int nmax=atom->nmax;
+  // calculate rotational energy
+  double ConvEng[3];
+  double CondEng[3];
+  for(int i=0; i<3; i++){
+    ConvEng[i]=0;
+    CondEng[i]=0;
+  }
+  double RotEng=0;
+  double KinEng=0;
+  double Rij[3];
+  
+  double Mass=12.0115*60;
+  const double mass2Kg=1.6726e-27;
+  const double eV2J= 1.6022e-19;
+  const double time2s = 1e-15;  //fs
+  const double A2m = 1e-10;
+  const double J2Kcalmol=1.44e20;
+  const double Box_length=14.4132*3;
+  
+  double unitConv=mass2Kg*A2m*A2m/time2s/time2s*J2Kcalmol;
+ 
+  // other way to calculate pe
+  if(1==dump_flag){
+  for (ibody = 0; ibody < nbody ; ibody++)
+  body_pe[ibody]=0;
+  double sum_pe=0;
+
+  for (int i = 0; i < npair; i++) {
+    ibody=int ((tag[i]-1)/60);
+    body_pe[ibody] +=  eatom[i];
+    sum_pe += eatom[i];
+  }
+  }
+  
+  if(1==dump_flag) {
+
+  for(int i=0; i<15; i++)  flux[i]=0;
+  
+  for(int ibody=0; ibody< nbody; ibody++){
+    RotEng=0.5 * (inertia[ibody][0]*omega[ibody][0]*omega[ibody][0]\
+                    +inertia[ibody][1]*omega[ibody][1]*omega[ibody][1]\
+                    + inertia[ibody][2]*omega[ibody][2]*omega[ibody][2]) * unitConv ;
+    KinEng=0.5 * Mass * (vcm[ibody][0]*vcm[ibody][0]\
+                    +vcm[ibody][1]*vcm[ibody][1]+vcm[ibody][2]*vcm[ibody][2])*unitConv;
+    ConvEng[0]+=  (RotEng+KinEng+body_pe[ibody]) *  vcm[ibody][0];
+    ConvEng[1]+=  (RotEng+KinEng+body_pe[ibody]) *  vcm[ibody][1];
+    ConvEng[2]+=  (RotEng+KinEng+body_pe[ibody]) *  vcm[ibody][2];
+    flux[0]+=KinEng*vcm[ibody][0];
+    flux[1]+=KinEng*vcm[ibody][1];
+    flux[2]+=KinEng*vcm[ibody][2];
+    flux[3]+=RotEng*vcm[ibody][0];
+    flux[4]+=RotEng*vcm[ibody][1];
+    flux[5]+=RotEng*vcm[ibody][2];
+    flux[6]+=body_pe[ibody]*vcm[ibody][0];
+    flux[7]+=body_pe[ibody]*vcm[ibody][1];
+    flux[8]+=body_pe[ibody]*vcm[ibody][2];
+  }
+
+
+  for(int ibody=0; ibody< nbody; ibody++){
+    for(int jbody=0; jbody< nbody; jbody++){
+      if(ibody==jbody) continue;
+      for(int idir=0; idir<3; idir++){
+        Rij[idir]=xcm[ibody][idir]-xcm[jbody][idir];
+        // Choose between real atom and ghost atom
+        if(Rij[idir]>=Box_length*0.5)
+          Rij[idir]-=Box_length;
+        if(Rij[idir]<=-Box_length*0.5)
+          Rij[idir]+=Box_length;
+  
+      }
+      for(int idir=0; idir<3; idir++){
+        CondEng[idir]+= (0.5 * Rij[idir] * (vcm[ibody][0]*final_force[ibody][jbody][0]+\
+                    vcm[ibody][1]*final_force[ibody][jbody][1]+\
+                    vcm[ibody][2]*final_force[ibody][jbody][2]+ \
+                    omega[ibody][0]*final_torque[ibody][jbody][0]+\
+                    omega[ibody][1]*final_torque[ibody][jbody][1]+\
+                    omega[ibody][2]*final_torque[ibody][jbody][2]));
+        flux[9+idir]+= (0.5 * Rij[idir]*(vcm[ibody][0]*final_force[ibody][jbody][0]+\
+                            vcm[ibody][1]*final_force[ibody][jbody][1]+\
+                            vcm[ibody][2]*final_force[ibody][jbody][2]));
+  
+        flux[12+idir]+= (0.5 * Rij[idir]*(omega[ibody][0]*final_torque[ibody][jbody][0]+\
+                            omega[ibody][1]*final_torque[ibody][jbody][1]+\
+                            omega[ibody][2]*final_torque[ibody][jbody][2]));
+      }
+    }
+  }
+  for (int i=0;i<15;i++){ cerr<<flux[i]<<"  "; }
+  cerr<<endl;
+  } // if(1==dump_flag)
 
   // compute current temperature
   if (tcomputeflag) t_current = temperature->compute_scalar();
