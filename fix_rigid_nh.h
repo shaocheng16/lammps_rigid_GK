@@ -47,6 +47,7 @@ class FixRigidNH : public FixRigid {
   double * cs_pe;
   double * cs_pe_final;
   double * body_pe;
+  double * body_mass;
   double * flux;
   
   int nmax;

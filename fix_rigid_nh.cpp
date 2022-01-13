@@ -153,9 +153,10 @@ FixRigidNH::FixRigidNH(LAMMPS *lmp, int narg, char **arg) :
   memory->create(cs_pe, natoms, "rigid_nh:cs_pe");
   memory->create(cs_pe_final, natoms,"rigid_nh:cs_pe_final");
   memory->create(body_pe, nbody, "rigid_nh:body_pe");
+  memory->create(body_mass, nbody, "rigid_nh:body_mass");
   memory->create(flux, 15, "rigid_nh:flux");
   // open the data file
-  mydata.open("my_dump_data.txt");
+  mydata.open("flux_data.txt");
   body_properties.open("body_properties.txt");
   // set the initial value for count
   ncount=0;
@@ -235,6 +236,7 @@ FixRigidNH::~FixRigidNH()
   memory->destroy(cs_pe);
   memory->destroy(cs_pe_final);
   memory->destroy(body_pe);
+  memory->destroy(body_mass);
   memory->destroy(flux);
   mydata.close();
   body_properties.close();
@@ -261,6 +263,9 @@ int FixRigidNH::setmask()
 void FixRigidNH::init()
 {
   FixRigid::init();
+  int *type = atom->type;
+  double *mass = atom->mass;  // mass for each type
+  int nlocal = atom->nlocal;
 
   // recheck that dilate group has not been deleted
 
@@ -385,6 +390,20 @@ void FixRigidNH::init()
   neighbor->requests[irequest]->half = 0;
   neighbor->requests[irequest]->full = 1;
   neighbor->requests[irequest]->occasional = 1;
+  // CS: calc the mass for each rigid body
+  int ibody = 0;
+  for (int i=0; i<nlocal; i++){
+          body_mass[ibody] =0;
+  }
+  for (int i=0; i<nlocal; i++){
+          ibody=body[i];
+          body_mass[ibody] += mass[type[i]];
+  }
+  for (int i=0; i<nlocal; i++){
+          cerr<< body_mass[ibody] << " ";
+  }
+  cerr<<endl;
+ 
 }
 
 /* ---------------------------------------------------------------------- */
@@ -697,7 +716,6 @@ void FixRigidNH::final_integrate()
   double dtf2 = dtf * 2.0;
 
   // CS: new variables
-  //
   int i;
   int inum,jnum;
   double ** x = atom->x;
@@ -705,14 +723,13 @@ void FixRigidNH::final_integrate()
   int **firstneigh;
   int j, itype , jtype;
   tagint *tag = atom->tag;
+  tagint *molecule = atom->molecule;
   tagint itag,jtag;
   int nlocal = atom->nlocal;
   // CS modified
   int npair = atom->nlocal;
   if (force->newton) npair += atom->nghost;
-  // CS end
-  //
-  //---------add by CS
+  
   double unwrap[3];
   double i_dx, i_dy, i_dz;   // disp vector of atom i in body body[i]
   double j_dx, j_dy, j_dz;   // disp vector of atom j in body body[j]
@@ -799,6 +816,7 @@ void FixRigidNH::final_integrate()
       itype = type[i];
 
       // disp vector of atom i in ibody
+      // body[i] or mol2body[molecule[i]]
       ibody=body[i];
 
       domain->unmap(x[i],xcmimage[i],unwrap);
@@ -807,7 +825,7 @@ void FixRigidNH::final_integrate()
       i_dz = unwrap[2] - xcm[ibody][2];
 
       for (int jj = 0; jj < jnum; jj++){
-        j = jlist[jj];
+        j = jlist[jj];  // index in the current core
         factor_lj = special_lj[sbmask(j)];
         factor_coul = special_coul[sbmask(j)];
 
@@ -817,7 +835,12 @@ void FixRigidNH::final_integrate()
         jtype = type[j];
 
 
-        jbody=int ((jtag-1)/60);
+        //jbody=int ((jtag-1)/60);
+        //CS: molecule[j]-1 is the correct molecule ID
+        // while body[j]  is partially correct, 
+        // body[jtag] is not correct
+        // more accurate: mol2body[molecule[j]]
+        jbody = mol2body[molecule[j]];
 
         domain->unmap(x[j],xcmimage[j],unwrap);
         j_dx = unwrap[0] - xcm[jbody][0];
@@ -854,11 +877,6 @@ void FixRigidNH::final_integrate()
  
     }
 
-    //for (ibody = 0; ibody < nbody; ibody++)
-    //  for (jbody = 0; jbody < nbody; jbody++){
-    //    cerr<< final_force[ibody][jbody][0]<<"\t";
-    //  }
-    //cerr<< endl;
 
 
   // update vcm and angmom
@@ -930,7 +948,7 @@ void FixRigidNH::final_integrate()
   // virial is already setup from initial_integrate
 
   set_v();
-  // CS
+  
   // post-processing for rigid-body Green-Kubo calculation
   // potential energy of each atoms
   double total_pe=0;
@@ -948,42 +966,59 @@ void FixRigidNH::final_integrate()
   double KinEng=0;
   double Rij[3];
   
-  double Mass=12.0115*60;
   const double mass2Kg=1.6726e-27;
   const double eV2J= 1.6022e-19;
   const double time2s = 1e-15;  //fs
   const double A2m = 1e-10;
   const double J2Kcalmol=1.44e20;
-  const double Box_length=14.4132*3;
   
-  double unitConv=mass2Kg*A2m*A2m/time2s/time2s*J2Kcalmol;
+  double unitConv=mass2Kg*A2m*A2m/time2s/time2s*J2Kcalmol; // energy conversion
+
  
   // other way to calculate pe
   if(1==dump_flag){
-  for (ibody = 0; ibody < nbody ; ibody++)
-  body_pe[ibody]=0;
+  for (ibody = 0; ibody < nbody ; ibody++) body_pe[ibody]=0;
+  
   double sum_pe=0;
 
+  // CS: need to loop npair here instead of inum, npair also includes the ghost atoms
   for (int i = 0; i < npair; i++) {
     ibody=int ((tag[i]-1)/60);
+    ibody = molecule[i] - 1;
     body_pe[ibody] +=  eatom[i];
     sum_pe += eatom[i];
   }
   }
+
+  for (int i = 0; i< nbody; i ++){
+          body_properties << body_pe[i] << "\t";
+  }
+  body_properties<<endl;
   
   if(1==dump_flag) {
 
   for(int i=0; i<15; i++)  flux[i]=0;
   
   for(int ibody=0; ibody< nbody; ibody++){
-    RotEng=0.5 * (inertia[ibody][0]*omega[ibody][0]*omega[ibody][0]\
-                    +inertia[ibody][1]*omega[ibody][1]*omega[ibody][1]\
-                    + inertia[ibody][2]*omega[ibody][2]*omega[ibody][2]) * unitConv ;
-    KinEng=0.5 * Mass * (vcm[ibody][0]*vcm[ibody][0]\
-                    +vcm[ibody][1]*vcm[ibody][1]+vcm[ibody][2]*vcm[ibody][2])*unitConv;
-    ConvEng[0]+=  (RotEng+KinEng+body_pe[ibody]) *  vcm[ibody][0];
-    ConvEng[1]+=  (RotEng+KinEng+body_pe[ibody]) *  vcm[ibody][1];
-    ConvEng[2]+=  (RotEng+KinEng+body_pe[ibody]) *  vcm[ibody][2];
+    RotEng = 0.0;
+    KinEng = 0.0;
+    for (int idir=0; idir < 3; idir ++){
+      RotEng += 0.5 * inertia[ibody][idir]*omega[ibody][idir]*omega[ibody][idir];
+      KinEng += 0.5 * body_mass[ibody]*vcm[ibody][idir]*vcm[ibody][idir];
+    }
+    RotEng *= unitConv; // convert the energy to the unit of Kcal/mol
+    KinEng *= unitConv;
+    // RotEng=0.5 * (inertia[ibody][0]*omega[ibody][0]*omega[ibody][0]\
+    //                 +inertia[ibody][1]*omega[ibody][1]*omega[ibody][1]\
+    //                 + inertia[ibody][2]*omega[ibody][2]*omega[ibody][2]);
+    // KinEng=0.5 * body_mass[ibody] * (vcm[ibody][0]*vcm[ibody][0]\
+    //                 +vcm[ibody][1]*vcm[ibody][1]+vcm[ibody][2]*vcm[ibody][2]);
+    for (int idir=0; idir < 3; idir ++){
+      ConvEng[idir]+=  (RotEng+KinEng+body_pe[ibody]) *  vcm[ibody][idir];
+    }
+    // ConvEng[0]+=  (RotEng+KinEng+body_pe[ibody]) *  vcm[ibody][0];
+    // ConvEng[1]+=  (RotEng+KinEng+body_pe[ibody]) *  vcm[ibody][1];
+    // ConvEng[2]+=  (RotEng+KinEng+body_pe[ibody]) *  vcm[ibody][2];
     flux[0]+=KinEng*vcm[ibody][0];
     flux[1]+=KinEng*vcm[ibody][1];
     flux[2]+=KinEng*vcm[ibody][2];
@@ -994,7 +1029,8 @@ void FixRigidNH::final_integrate()
     flux[7]+=body_pe[ibody]*vcm[ibody][1];
     flux[8]+=body_pe[ibody]*vcm[ibody][2];
   }
-
+    
+  //cerr<< "box length" << Box_length << " boxlo="<< domain->boxlo[0]<<" boxhi="<<domain->boxhi[0]<< endl;
 
   for(int ibody=0; ibody< nbody; ibody++){
     for(int jbody=0; jbody< nbody; jbody++){
@@ -1002,10 +1038,10 @@ void FixRigidNH::final_integrate()
       for(int idir=0; idir<3; idir++){
         Rij[idir]=xcm[ibody][idir]-xcm[jbody][idir];
         // Choose between real atom and ghost atom
-        if(Rij[idir]>=Box_length*0.5)
-          Rij[idir]-=Box_length;
-        if(Rij[idir]<=-Box_length*0.5)
-          Rij[idir]+=Box_length;
+        if(Rij[idir]>=(domain->boxhi[idir] - domain->boxlo[idir])*0.5)
+          Rij[idir]-=(domain->boxhi[idir] - domain->boxlo[idir]);
+        if(Rij[idir]<=-(domain->boxhi[idir] - domain->boxlo[idir])*0.5)
+          Rij[idir]+=(domain->boxhi[idir] - domain->boxlo[idir]);
   
       }
       for(int idir=0; idir<3; idir++){
@@ -1025,9 +1061,14 @@ void FixRigidNH::final_integrate()
       }
     }
   }
-  for (int i=0;i<15;i++){ cerr<<flux[i]<<"  "; }
-  cerr<<endl;
+  // CS: write flux to file
+  for (int i=0;i<15;i++){ 
+    mydata<<flux[i]<<" "; 
+  }
+  mydata<<endl;
+  mydata.flush();
   } // if(1==dump_flag)
+ 
 
   // compute current temperature
   if (tcomputeflag) t_current = temperature->compute_scalar();
