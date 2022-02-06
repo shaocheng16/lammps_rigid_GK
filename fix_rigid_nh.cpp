@@ -21,6 +21,7 @@
 #include "fix_rigid_nh.h"
 
 #include "atom.h"
+#include "molecule.h"
 #include "comm.h"
 #include "compute.h"
 #include "domain.h"
@@ -144,7 +145,6 @@ FixRigidNH::FixRigidNH(LAMMPS *lmp, int narg, char **arg) :
 
   // memory allocation and initialization
   // CS modified
-  cerr<<"==== start to create the memory, nbody = "<< nbody<<endl;
   memory->create(total_torque,nbody,3,"rigid_nh:total_torque");     //total torque of each particle
   memory->create(pair_torque, nbody, nbody,3,"rigid_nh:pair_torque");
   memory->create(final_torque, nbody, nbody,3,"rigid_nh:final_torque");
@@ -157,7 +157,6 @@ FixRigidNH::FixRigidNH(LAMMPS *lmp, int narg, char **arg) :
   memory->create(body_pe, nbody, "rigid_nh:body_pe");
   memory->create(body_mass, nbody, "rigid_nh:body_mass");
   memory->create(flux, 15, "rigid_nh:flux");
-  cerr<<"==== end of  create the memory"<<endl;
   // open the data file
   std::ostringstream fname;
   fname<<"flux_data_"<<id<<".txt";
@@ -233,30 +232,21 @@ FixRigidNH::~FixRigidNH()
   }
 
   // CS: start modification
-  cerr<<"start to distryy the memory"<<endl;
   memory->destroy(pair_torque);
-  cerr<<"End of destroy the memory, pair_torque"<<endl;
   memory->destroy(final_torque);
   memory->destroy(total_torque);
   memory->destroy(pair_force);
   memory->destroy(final_force);
   memory->destroy(total_force);
-  cerr<<"End of destroy the memory, total force"<<endl;
   
   // CS modified
   memory->destroy(cs_pe);
-  cerr<<"End of destroy the memory, cs_pe"<<endl;
   memory->destroy(cs_pe_final);
-  cerr<<"End of destroy the memory, cs_pe_final"<<endl;
   memory->destroy(body_pe);
-  cerr<<"End of destroy the memory, body_pe"<<endl;
   memory->destroy(body_mass);
-  cerr<<"End of destroy the memory, body_mass"<<endl;
   memory->destroy(flux);
-  cerr<<"End of destroy the memory, flux"<<endl;
   mydata.close();
   body_properties.close();
-  cerr<<"End of destroy the memory"<<endl;
   // CS end
 }
 
@@ -416,15 +406,12 @@ void FixRigidNH::init()
   int ibody = 0;
   for (int i=0; i<nlocal; i++){
           ibody=body[i];
-          cerr<<"i="<<i<<", tag[i]="<< tag[i]<<", ibody="<<ibody\
-                  <<", molecule[i]= "<< molecule[i] \
-                  <<", mol2body[ii]="<< mol2body[molecule[i]]<< endl;
           if (ibody >=0) body_mass[ibody] += mass[type[i]];
   }
-  for (int ibody=0; ibody < nbody; ibody++){
-          cerr<< body_mass[ibody] << " ";
-  }
-  cerr<<endl;
+  //for (int ibody=0; ibody < nbody; ibody++){
+  //        cerr<< body_mass[ibody] << " ";
+  //}
+  //cerr<<endl;
  
 }
 
@@ -432,6 +419,7 @@ void FixRigidNH::init()
 
 void FixRigidNH::setup(int vflag)
 {
+  tagint *molecule = atom->molecule;
   FixRigid::setup(vflag);
 
   double mbody[3];
@@ -530,10 +518,10 @@ void FixRigidNH::setup(int vflag)
     compute_press_target();
     nh_epsilon_dot();
   }
-  cerr<<"===================="<<endl;
-  cerr<<"nbody = "<< nbody<<endl;
-  cerr<< "fix_id"<< id<<endl;
-  cerr<<"===================="<<endl;
+  int nmolecule = -1;
+  for (int i = 0; i < natoms; i++){
+      if (molecule[i]> nmolecule) nmolecule = molecule[i];
+  }
   // CS: start modification
   for (int ibody = 0; ibody < nbody; ibody++)
     for (int jbody=0; jbody < nbody; jbody++ )
@@ -556,7 +544,6 @@ void FixRigidNH::setup(int vflag)
   // CS modified
   for (int ibody = 0; ibody < nbody; ibody++)
       body_pe[ibody]=0;
-   cerr<<"natoms="<<natoms<<endl;
   for (int i = 0; i < natoms; i++){
       cs_pe[i] = 0;
       cs_pe_final[i] = 0;
@@ -868,10 +855,6 @@ void FixRigidNH::final_integrate()
         jbody = mol2body[molecule[j]];
         if (jbody == -1) continue;  // means not in a rigid body
 
-        //cerr<<"i = "<< i << "\tj = "<< j <<endl;
-        //cerr<<"itag = " << itag << "\t jtag = "<< jtag<<endl;
-        //cerr<<"itype = " << itype << "\t jtype = "<< jtype<<endl;
-        //cerr<<"ibody = "<< ibody << "\tjbody = "<< jbody<<endl;
 
         domain->unmap(x[j],xcmimage[j],unwrap);
         j_dx = unwrap[0] - xcm[jbody][0];
@@ -989,8 +972,9 @@ void FixRigidNH::final_integrate()
   // post-processing for rigid-body Green-Kubo calculation
   // potential energy of each atoms
   double total_pe=0;
+  double * eatom ;
   eatom = force->pair->eatom;
-  if(!eatom) dump_flag=0;
+  //if(!eatom) dump_flag=0;
   int nmax=atom->nmax;
   // calculate rotational energy
   double ConvEng[3];
@@ -1022,8 +1006,6 @@ void FixRigidNH::final_integrate()
   for (int i = 0; i < npair; i++) {
     ibody = mol2body[molecule[i]];
     if(ibody<0) continue;
-    //cerr<<"i="<<i<<", tag[i]="<< tag[i]<<", body[i] = "<<body[i]\
-            <<", mol2body[  ] = "<<mol2body[molecule[i]]<<endl;
     body_pe[ibody] +=  eatom[i];
     sum_pe += eatom[i];
   }
@@ -1105,6 +1087,17 @@ void FixRigidNH::final_integrate()
       }
     }
   }
+  for(int ibody=0; ibody< nbody; ibody++){
+    body_properties <<ibody<<" "<<  omega[ibody][0]<< " "<< omega[ibody][1]<<" "<<omega[ibody][2]<<" ";
+    body_properties<< inertia[ibody][0]<<" " <<inertia[ibody][1]<<" "<< inertia[ibody][2]<< " ";
+    body_properties<<endl;
+  }
+body_properties<<endl;
+ body_properties.flush();
+  //      }
+  //      
+  //  }
+  //  
   // CS: write flux to file
   for (int i=0;i<15;i++){ 
     mydata<<flux[i]<<" "; 
