@@ -47,6 +47,7 @@
 #include "pair.h"
 #include <iomanip>
 #include <iostream>
+#include <sstream>
 
 using namespace LAMMPS_NS;
 using namespace FixConst;
@@ -143,6 +144,7 @@ FixRigidNH::FixRigidNH(LAMMPS *lmp, int narg, char **arg) :
 
   // memory allocation and initialization
   // CS modified
+  cerr<<"==== start to create the memory, nbody = "<< nbody<<endl;
   memory->create(total_torque,nbody,3,"rigid_nh:total_torque");     //total torque of each particle
   memory->create(pair_torque, nbody, nbody,3,"rigid_nh:pair_torque");
   memory->create(final_torque, nbody, nbody,3,"rigid_nh:final_torque");
@@ -155,9 +157,15 @@ FixRigidNH::FixRigidNH(LAMMPS *lmp, int narg, char **arg) :
   memory->create(body_pe, nbody, "rigid_nh:body_pe");
   memory->create(body_mass, nbody, "rigid_nh:body_mass");
   memory->create(flux, 15, "rigid_nh:flux");
+  cerr<<"==== end of  create the memory"<<endl;
   // open the data file
-  mydata.open("flux_data.txt");
-  body_properties.open("body_properties.txt");
+  std::ostringstream fname;
+  fname<<"flux_data_"<<id<<".txt";
+  mydata.open(fname.str());
+  
+  std::ostringstream fname2;
+  fname2<<"body_properties_"<<id<<".txt";
+  body_properties.open(fname2.str());
   // set the initial value for count
   ncount=0;
   never=5;
@@ -225,21 +233,30 @@ FixRigidNH::~FixRigidNH()
   }
 
   // CS: start modification
+  cerr<<"start to distryy the memory"<<endl;
   memory->destroy(pair_torque);
+  cerr<<"End of destroy the memory, pair_torque"<<endl;
   memory->destroy(final_torque);
   memory->destroy(total_torque);
   memory->destroy(pair_force);
   memory->destroy(final_force);
   memory->destroy(total_force);
+  cerr<<"End of destroy the memory, total force"<<endl;
   
   // CS modified
   memory->destroy(cs_pe);
+  cerr<<"End of destroy the memory, cs_pe"<<endl;
   memory->destroy(cs_pe_final);
+  cerr<<"End of destroy the memory, cs_pe_final"<<endl;
   memory->destroy(body_pe);
+  cerr<<"End of destroy the memory, body_pe"<<endl;
   memory->destroy(body_mass);
+  cerr<<"End of destroy the memory, body_mass"<<endl;
   memory->destroy(flux);
+  cerr<<"End of destroy the memory, flux"<<endl;
   mydata.close();
   body_properties.close();
+  cerr<<"End of destroy the memory"<<endl;
   // CS end
 }
 
@@ -266,6 +283,8 @@ void FixRigidNH::init()
   int *type = atom->type;
   double *mass = atom->mass;  // mass for each type
   int nlocal = atom->nlocal;
+  tagint *tag = atom->tag;
+  tagint *molecule = atom->molecule;
 
   // recheck that dilate group has not been deleted
 
@@ -391,15 +410,18 @@ void FixRigidNH::init()
   neighbor->requests[irequest]->full = 1;
   neighbor->requests[irequest]->occasional = 1;
   // CS: calc the mass for each rigid body
-  int ibody = 0;
-  for (int i=0; i<nlocal; i++){
+  for (int ibody=0; ibody < nbody; ibody++){
           body_mass[ibody] =0;
   }
+  int ibody = 0;
   for (int i=0; i<nlocal; i++){
           ibody=body[i];
-          body_mass[ibody] += mass[type[i]];
+          cerr<<"i="<<i<<", tag[i]="<< tag[i]<<", ibody="<<ibody\
+                  <<", molecule[i]= "<< molecule[i] \
+                  <<", mol2body[ii]="<< mol2body[molecule[i]]<< endl;
+          if (ibody >=0) body_mass[ibody] += mass[type[i]];
   }
-  for (int i=0; i<nlocal; i++){
+  for (int ibody=0; ibody < nbody; ibody++){
           cerr<< body_mass[ibody] << " ";
   }
   cerr<<endl;
@@ -508,6 +530,10 @@ void FixRigidNH::setup(int vflag)
     compute_press_target();
     nh_epsilon_dot();
   }
+  cerr<<"===================="<<endl;
+  cerr<<"nbody = "<< nbody<<endl;
+  cerr<< "fix_id"<< id<<endl;
+  cerr<<"===================="<<endl;
   // CS: start modification
   for (int ibody = 0; ibody < nbody; ibody++)
     for (int jbody=0; jbody < nbody; jbody++ )
@@ -530,7 +556,7 @@ void FixRigidNH::setup(int vflag)
   // CS modified
   for (int ibody = 0; ibody < nbody; ibody++)
       body_pe[ibody]=0;
-   //cerr<<"nmax="<<nmax<<endl;
+   cerr<<"natoms="<<natoms<<endl;
   for (int i = 0; i < natoms; i++){
       cs_pe[i] = 0;
       cs_pe_final[i] = 0;
@@ -551,6 +577,7 @@ void FixRigidNH::initial_integrate(int vflag)
   double tmp,scale_r,scale_t[3],scale_v[3];
   double dtfm,mbody[3],tbody[3],fquat[4];
   double dtf2 = dtf * 2.0;
+  //tagint *tag = atom->tag;
 
   // compute scale variables
 
@@ -783,11 +810,7 @@ void FixRigidNH::final_integrate()
 
     akin_t = akin_r = 0.0;
   }
-
-  // late calculation of forces and torques (if requested)
-
-  if (!earlyflag) compute_forces_and_torques();
-
+  
   if(1==dump_flag){ // CS: start modification
     for (ibody = 0; ibody < nbody; ibody++)
       for (jbody = 0; jbody < nbody; jbody++){
@@ -824,6 +847,8 @@ void FixRigidNH::final_integrate()
       i_dy = unwrap[1] - xcm[ibody][1];
       i_dz = unwrap[2] - xcm[ibody][2];
 
+      if (ibody == -1) continue;  // means not in a rigid body
+
       for (int jj = 0; jj < jnum; jj++){
         j = jlist[jj];  // index in the current core
         factor_lj = special_lj[sbmask(j)];
@@ -841,6 +866,12 @@ void FixRigidNH::final_integrate()
         // body[jtag] is not correct
         // more accurate: mol2body[molecule[j]]
         jbody = mol2body[molecule[j]];
+        if (jbody == -1) continue;  // means not in a rigid body
+
+        //cerr<<"i = "<< i << "\tj = "<< j <<endl;
+        //cerr<<"itag = " << itag << "\t jtag = "<< jtag<<endl;
+        //cerr<<"itype = " << itype << "\t jtype = "<< jtype<<endl;
+        //cerr<<"ibody = "<< ibody << "\tjbody = "<< jbody<<endl;
 
         domain->unmap(x[j],xcmimage[j],unwrap);
         j_dx = unwrap[0] - xcm[jbody][0];
@@ -876,6 +907,11 @@ void FixRigidNH::final_integrate()
     MPI_Allreduce(pair_force[0][0],final_force[0][0],3*nbody*nbody,MPI_DOUBLE,MPI_SUM,world);
  
     }
+
+  // late calculation of forces and torques (if requested)
+
+  if (!earlyflag) compute_forces_and_torques();
+
 
 
 
@@ -943,6 +979,7 @@ void FixRigidNH::final_integrate()
         angmom[ibody][2]*omega[ibody][2];
     }
   }
+  
 
   // set velocity/rotation of atoms in rigid bodies
   // virial is already setup from initial_integrate
@@ -983,17 +1020,24 @@ void FixRigidNH::final_integrate()
 
   // CS: need to loop npair here instead of inum, npair also includes the ghost atoms
   for (int i = 0; i < npair; i++) {
-    ibody=int ((tag[i]-1)/60);
-    ibody = molecule[i] - 1;
+    ibody = mol2body[molecule[i]];
+    if(ibody<0) continue;
+    //cerr<<"i="<<i<<", tag[i]="<< tag[i]<<", body[i] = "<<body[i]\
+            <<", mol2body[  ] = "<<mol2body[molecule[i]]<<endl;
     body_pe[ibody] +=  eatom[i];
     sum_pe += eatom[i];
   }
   }
-
-  for (int i = 0; i< nbody; i ++){
-          body_properties << body_pe[i] << "\t";
-  }
-  body_properties<<endl;
+   // write body torque
+  //for (int ibody = 0; ibody< nbody; ibody ++){
+  //  for(int jbody=0; jbody< nbody; jbody++){
+  //      for (int jdir = 0; jdir < 3; jdir ++){
+  //        body_properties << final_torque[ibody][jbody][jdir]<< "\t";
+  //      }
+  //      
+  //  }
+  //  body_properties << endl;
+  //}
   
   if(1==dump_flag) {
 
